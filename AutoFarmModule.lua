@@ -515,15 +515,11 @@ local function attackEnemy(enemy)
     
     local HRP = waitForCharacter()
     if not HRP then return false end
+    -- Set position to be high above ground (cố định đứng trên trời)
+    HRP.CFrame = CFrame.new(HRP.Position.X, 500, HRP.Position.Z)
     
-    -- 🎯 Get optimal attack position (FIXED: không bay lơ lửng)
-    local attackCFrame = getOptimalAttackPosition(enemy)
-    if not attackCFrame then return false end
-    
-    -- 🚀 Move to attack position
-    local success = safeCall(function()
-        HRP.CFrame = attackCFrame
-    end)
+    -- 🚀 Stand still on sky, no move to enemy
+    -- You stay at your current position and attack from distance
     
     if not success then return false end
     
