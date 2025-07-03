@@ -1,5 +1,5 @@
--- 📦 AutoFarmModule.lua (FIXED VERSION): Tự động farm 5 tầng dungeon trong King Legacy
--- ✅ Đã fix các lỗi nghiêm trọng và cải tiến hiệu suất
+-- 📦 AutoFarmModule.lua (ENHANCED VERSION): Tự động farm 5 tầng dungeon trong King Legacy
+-- ✅ Fixed: Bay lơ lửng, Target tracking, Enhanced combat system
 
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
@@ -19,8 +19,12 @@ local CONFIG = {
     respawnWaitTime = 10,
     dungeonCooldown = 25, -- Thời gian chờ giữa các lần chạy dungeon
     
-    -- 🆘 Custom dungeon circle position (set này nếu auto-detect fail)
-    -- Ví dụ: customDungeonCircle = CFrame.new(x, y, z)
+    -- 🎯 Combat settings
+    attackDistance = 8, -- Khoảng cách tấn công
+    attackHeight = 2, -- Chiều cao tấn công (thay vì 10)
+    targetSwitchDelay = 3, -- Thời gian chờ trước khi đổi target
+    
+    -- 🆘 Custom dungeon circle position
     customDungeonCircle = nil,
 }
 
@@ -30,7 +34,10 @@ local GameState = {
     currentFloor = 0,
     enemiesKilled = 0,
     lastFruitUse = 0,
-    lastStatus = "Standby"
+    lastStatus = "Standby",
+    currentTarget = nil, -- 🎯 Target hiện tại
+    targetLockTime = 0, -- Thời gian lock target
+    lastTargetHealth = 0, -- Máu target lần cuối
 }
 
 -- 🛡️ Utility Functions
@@ -280,17 +287,15 @@ local function performSpamClick(count)
     count = count or 5
     for i = 1, count do
         performClick()
-        -- 🛡️ Increased random delay to avoid anti-cheat
         randomWait(0.2, 0.4)
     end
-    randomWait(1.8, 3.0) -- Longer pause after spam
+    randomWait(1.8, 3.0)
 end
 
 local function pressKey(key)
     sendInput("key", key, true)
     randomWait(0.05, 0.12)
     sendInput("key", key, false)
-    -- 🛡️ Increased delay after key press
     randomWait(0.3, 0.6)
 end
 
@@ -320,7 +325,6 @@ local function equipToolBySlot(slot)
     local tool = tools[slot]
     local backpack = LocalPlayer:FindFirstChild("Backpack")
     
-    -- 🔍 Kiểm tra tool còn valid không
     if not tool.Parent or tool.Parent ~= backpack or not tool:IsDescendantOf(backpack) then
         warn("⚠️ Tool is invalid or not in backpack: " .. tool.Name)
         return false
@@ -331,7 +335,6 @@ local function equipToolBySlot(slot)
     end)
     
     if success then
-        -- Verify tool was actually equipped
         task.wait(0.1)
         local equippedTool = LocalPlayer.Character:FindFirstChildOfClass("Tool")
         if equippedTool and equippedTool.Name == tool.Name then
@@ -358,7 +361,6 @@ local function equipToolByName(toolName)
         return false
     end
     
-    -- 🔍 Kiểm tra tool còn valid không
     if not tool.Parent or tool.Parent ~= backpack or not tool:IsDescendantOf(backpack) then
         warn("⚠️ Tool is invalid or not in backpack: " .. toolName)
         return false
@@ -369,7 +371,6 @@ local function equipToolByName(toolName)
     end)
     
     if success then
-        -- Verify tool was actually equipped
         task.wait(0.1)
         local equippedTool = LocalPlayer.Character:FindFirstChildOfClass("Tool")
         if equippedTool and equippedTool.Name == toolName then
@@ -384,7 +385,7 @@ local function equipToolByName(toolName)
     return false
 end
 
--- 👹 Enemy Detection (FIXED)
+-- 👹 Enemy Detection & Management
 local function isValidEnemy(obj)
     if not obj or not obj:IsA("Model") then return false end
     if not obj:FindFirstChild("Humanoid") or not obj:FindFirstChild("HumanoidRootPart") then return false end
@@ -410,9 +411,8 @@ local function isValidEnemy(obj)
         end
     end
     
-    -- If name doesn't match, check if it has enemy-like properties
+    -- If name doesn't match, check if it's in a specific folder or has enemy tags
     if not isEnemy then
-        -- Check if it's in a specific folder or has enemy tags
         local parent = obj.Parent
         if parent and (parent.Name:find("Enemy") or parent.Name:find("Monster") or parent.Name:find("Boss")) then
             isEnemy = true
@@ -422,6 +422,17 @@ local function isValidEnemy(obj)
     return isEnemy
 end
 
+local function isValidTarget(enemy)
+    if not enemy or not enemy.Parent then return false end
+    if not enemy:FindFirstChild("Humanoid") or not enemy:FindFirstChild("HumanoidRootPart") then return false end
+    if enemy.Humanoid.Health <= 0 then return false end
+    
+    -- Check if still in dungeon area
+    local enemyPos = enemy.HumanoidRootPart.Position
+    local distanceFromDungeon = (enemyPos - CONFIG.dungeonPos).Magnitude
+    return distanceFromDungeon < CONFIG.dungeonRadius
+end
+
 local function getEnemiesInDungeon()
     if not isInDungeon() then return {} end
     
@@ -429,13 +440,12 @@ local function getEnemiesInDungeon()
     local searchStart = tick()
     
     for _, obj in pairs(workspace:GetDescendants()) do
-        if tick() - searchStart > 5 then break end -- Timeout enemy search
+        if tick() - searchStart > 5 then break end
         
         if isValidEnemy(obj) then
             local enemyPos = obj.HumanoidRootPart.Position
             local distanceFromDungeon = (enemyPos - CONFIG.dungeonPos).Magnitude
             
-            -- Only include enemies within dungeon area
             if distanceFromDungeon < CONFIG.dungeonRadius then
                 table.insert(enemies, obj)
             end
@@ -445,7 +455,57 @@ local function getEnemiesInDungeon()
     return enemies
 end
 
--- 🗡️ Combat Actions
+local function selectBestTarget(enemies)
+    if not enemies or #enemies == 0 then return nil end
+    
+    local HRP = waitForCharacter()
+    if not HRP then return nil end
+    
+    local bestTarget = nil
+    local closestDistance = math.huge
+    
+    for _, enemy in pairs(enemies) do
+        if isValidTarget(enemy) then
+            local distance = (HRP.Position - enemy.HumanoidRootPart.Position).Magnitude
+            if distance < closestDistance then
+                closestDistance = distance
+                bestTarget = enemy
+            end
+        end
+    end
+    
+    return bestTarget
+end
+
+-- 🗡️ Enhanced Combat Actions
+local function getOptimalAttackPosition(enemy)
+    if not enemy or not enemy:FindFirstChild("HumanoidRootPart") then return nil end
+    
+    local enemyRoot = enemy.HumanoidRootPart
+    local enemyPos = enemyRoot.Position
+    
+    -- 🎯 Calculate attack position (không bay lơ lửng)
+    local attackOffset = Vector3.new(
+        math.random(-CONFIG.attackDistance, CONFIG.attackDistance),
+        CONFIG.attackHeight, -- Chỉ 2 units thay vì 10
+        math.random(-CONFIG.attackDistance, CONFIG.attackDistance)
+    )
+    
+    -- 🔍 Check if position is valid (not too high or inside walls)
+    local attackPosition = enemyPos + attackOffset
+    
+    -- 🛡️ Ground check - make sure we're not too high
+    local raycast = workspace:Raycast(attackPosition, Vector3.new(0, -50, 0))
+    if raycast and raycast.Position then
+        local groundY = raycast.Position.Y
+        if attackPosition.Y > groundY + 15 then -- Max 15 units above ground
+            attackPosition = Vector3.new(attackPosition.X, groundY + CONFIG.attackHeight, attackPosition.Z)
+        end
+    end
+    
+    return CFrame.new(attackPosition, enemyPos)
+end
+
 local function attackEnemy(enemy)
     if not enemy or not enemy.Parent then return false end
     if not isAlive() then return false end
@@ -456,17 +516,20 @@ local function attackEnemy(enemy)
     local HRP = waitForCharacter()
     if not HRP then return false end
     
-    -- Position near enemy
-    local attackPosition = enemyRoot.CFrame + Vector3.new(
-        math.random(-5, 5),
-        math.random(2, 8),
-        math.random(-5, 5)
-    )
+    -- 🎯 Get optimal attack position (FIXED: không bay lơ lửng)
+    local attackCFrame = getOptimalAttackPosition(enemy)
+    if not attackCFrame then return false end
     
-    HRP.CFrame = attackPosition
+    -- 🚀 Move to attack position
+    local success = safeCall(function()
+        HRP.CFrame = attackCFrame
+    end)
+    
+    if not success then return false end
+    
     randomWait(0.1, 0.2)
     
-    -- Combat sequence
+    -- 🗡️ Combat sequence
     if equipToolBySlot(1) then -- Devil Fruit
         pressKey(Enum.KeyCode.Z)
         randomWait(0.3, 0.5)
@@ -478,7 +541,7 @@ local function attackEnemy(enemy)
         performSpamClick(math.random(3, 7))
     end
     
-    -- Use fruit ability periodically
+    -- 🍎 Use fruit ability periodically
     if tick() - GameState.lastFruitUse > 20 then
         if equipToolBySlot(1) then
             pressKey(Enum.KeyCode.Z)
@@ -489,10 +552,11 @@ local function attackEnemy(enemy)
     return true
 end
 
--- 🏰 Dungeon Farming Logic
+-- 🏰 Enhanced Floor Clearing with Target System
 local function clearFloor(floorNumber)
     log("⚔️ Starting floor " .. floorNumber)
     GameState.currentFloor = floorNumber
+    GameState.currentTarget = nil
     
     local floorStartTime = tick()
     local enemiesKilledThisFloor = 0
@@ -508,31 +572,54 @@ local function clearFloor(floorNumber)
             return false
         end
         
-        local enemies = getEnemiesInDungeon()
-        
-        if #enemies == 0 then
-            log("✅ Floor " .. floorNumber .. " cleared! Enemies killed: " .. enemiesKilledThisFloor)
-            randomWait(2, 4)
-            return true
-        end
-        
-        -- Attack enemies
-        for i, enemy in pairs(enemies) do
-            if not enemy.Parent then continue end
+        -- 🎯 Target management system
+        if not GameState.currentTarget or not isValidTarget(GameState.currentTarget) then
+            -- Find new target
+            local enemies = getEnemiesInDungeon()
             
-            local success = attackEnemy(enemy)
-            if success then
-                enemiesKilledThisFloor = enemiesKilledThisFloor + 1
-                GameState.enemiesKilled = GameState.enemiesKilled + 1
+            if #enemies == 0 then
+                log("✅ Floor " .. floorNumber .. " cleared! Enemies killed: " .. enemiesKilledThisFloor)
+                randomWait(2, 4)
+                return true
             end
             
-            randomWait(0.2, 0.5)
-            
-            -- Break if too many enemies (performance)
-            if i >= 5 then break end
+            GameState.currentTarget = selectBestTarget(enemies)
+            if GameState.currentTarget then
+                GameState.targetLockTime = tick()
+                GameState.lastTargetHealth = GameState.currentTarget.Humanoid.Health
+                log("🎯 New target: " .. GameState.currentTarget.Name .. " (HP: " .. GameState.lastTargetHealth .. ")")
+            end
         end
         
-        randomWait(1, 2)
+        -- 🗡️ Attack current target
+        if GameState.currentTarget and isValidTarget(GameState.currentTarget) then
+            local success = attackEnemy(GameState.currentTarget)
+            if success then
+                local currentHealth = GameState.currentTarget.Humanoid.Health
+                
+                -- Check if we're doing damage
+                if currentHealth < GameState.lastTargetHealth then
+                    GameState.lastTargetHealth = currentHealth
+                    GameState.targetLockTime = tick() -- Reset lock time if doing damage
+                end
+                
+                -- Check if target is dead
+                if currentHealth <= 0 then
+                    enemiesKilledThisFloor = enemiesKilledThisFloor + 1
+                    GameState.enemiesKilled = GameState.enemiesKilled + 1
+                    log("💀 Target killed! Total: " .. GameState.enemiesKilled)
+                    GameState.currentTarget = nil
+                end
+            end
+            
+            -- 🔄 Switch target if stuck too long
+            if tick() - GameState.targetLockTime > CONFIG.targetSwitchDelay then
+                log("🔄 Switching target (stuck for " .. CONFIG.targetSwitchDelay .. "s)")
+                GameState.currentTarget = nil
+            end
+        end
+        
+        randomWait(0.5, 1.0)
     end
     
     warn("⏰ Floor " .. floorNumber .. " timeout after " .. CONFIG.floorTimeout .. " seconds")
@@ -548,6 +635,7 @@ local function farmDungeon()
     log("🏰 Starting dungeon farm (5 floors)")
     GameState.currentFloor = 0
     GameState.enemiesKilled = 0
+    GameState.currentTarget = nil
     
     for floor = 1, CONFIG.maxFloors do
         if not GameState.isRunning then
@@ -571,9 +659,9 @@ local function farmDungeon()
     return true
 end
 
--- 🎨 UI System
+-- 🎨 Enhanced UI System
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "AutoFarmUI_Fixed"
+ScreenGui.Name = "AutoFarmUI_Enhanced"
 ScreenGui.Parent = CoreGui
 
 -- Main toggle button
@@ -594,10 +682,10 @@ local Corner1 = Instance.new("UICorner")
 Corner1.CornerRadius = UDim.new(0, 8)
 Corner1.Parent = ToggleButton
 
--- Status display
+-- Enhanced Status display
 local StatusFrame = Instance.new("Frame")
 StatusFrame.Name = "StatusFrame"
-StatusFrame.Size = UDim2.new(0, 280, 0, 100)
+StatusFrame.Size = UDim2.new(0, 320, 0, 120)
 StatusFrame.Position = UDim2.new(0, 160, 0, 10)
 StatusFrame.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
 StatusFrame.BorderSizePixel = 0
@@ -615,23 +703,30 @@ StatusLabel.Position = UDim2.new(0, 5, 0, 5)
 StatusLabel.BackgroundTransparency = 1
 StatusLabel.TextColor3 = Color3.new(1, 1, 1)
 StatusLabel.Font = Enum.Font.Gotham
-StatusLabel.TextSize = 12
+StatusLabel.TextSize = 11
 StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
 StatusLabel.TextYAlignment = Enum.TextYAlignment.Top
-StatusLabel.Text = "Status: Standby\nFloor: 0/5\nEnemies Killed: 0\nLocation: Outside Dungeon"
+StatusLabel.Text = "Status: Standby\nFloor: 0/5\nEnemies Killed: 0\nCurrent Target: None\nLocation: Outside Dungeon"
 StatusLabel.Parent = StatusFrame
 
--- 🎮 UI Event Handlers
+-- 🎮 Enhanced UI Event Handlers
 local function updateUI()
     local locationText = isInDungeon() and "Inside Dungeon" or "Outside Dungeon"
     local statusText = GameState.isRunning and "FARMING" or "STANDBY"
+    local targetText = GameState.currentTarget and GameState.currentTarget.Name or "None"
+    local targetHealth = GameState.currentTarget and math.floor(GameState.currentTarget.Humanoid.Health) or 0
+    
+    if GameState.currentTarget and targetHealth > 0 then
+        targetText = targetText .. " (HP: " .. targetHealth .. ")"
+    end
     
     StatusLabel.Text = string.format(
-        "Status: %s\nFloor: %d/%d\nEnemies Killed: %d\nLocation: %s",
+        "Status: %s\nFloor: %d/%d\nEnemies Killed: %d\nCurrent Target: %s\nLocation: %s",
         statusText,
         GameState.currentFloor,
         CONFIG.maxFloors,
         GameState.enemiesKilled,
+        targetText,
         locationText
     )
     
@@ -654,6 +749,7 @@ local function mainLoop()
             if GameState.isRunning then
                 if not isAlive() then
                     log("💀 Waiting for respawn...")
+                    GameState.currentTarget = nil -- Reset target on death
                     repeat 
                         task.wait(1) 
                         updateUI()
@@ -665,6 +761,7 @@ local function mainLoop()
                 
                 if not isInDungeon() then
                     log("🌀 Teleporting to dungeon...")
+                    GameState.currentTarget = nil -- Reset target when outside dungeon
                     local dungeonCFrame = findDungeonCircle()
                     
                     if teleportTo(dungeonCFrame) then
@@ -700,6 +797,7 @@ local function mainLoop()
                 
                 -- Return to dungeon circle
                 log("🏠 Returning to dungeon entrance...")
+                GameState.currentTarget = nil
                 teleportTo(findDungeonCircle())
                 
                 -- Cooldown
@@ -718,9 +816,13 @@ local function mainLoop()
 end
 
 -- 🏁 Initialize
-log("🎮 AutoFarm Module Loaded Successfully!")
-log("📋 Features: Anti-Detection, Safe Enemy Detection, Error Handling")
-log("🎯 Click the toggle button to start/stop farming")
+log("🎮 AutoFarm Module Enhanced Successfully!")
+log("🎯 NEW FEATURES:")
+log("   ✅ Fixed floating attack position")
+log("   ✅ Enhanced target tracking system")
+log("   ✅ Smart ground detection")
+log("   ✅ Improved enemy selection")
+log("📋 Click the toggle button to start/stop farming")
 
 mainLoop()
 
@@ -733,6 +835,7 @@ return {
     
     Stop = function()
         GameState.isRunning = false
+        GameState.currentTarget = nil
         updateUI()
     end,
     
@@ -740,5 +843,33 @@ return {
         return GameState
     end,
     
-    Config = CONFIG
+    SetTarget = function(target)
+        if isValidTarget(target) then
+            GameState.currentTarget = target
+            GameState.targetLockTime = tick()
+            GameState.lastTargetHealth = target.Humanoid.Health
+            log("🎯 Manual target set: " .. target.Name)
+        end
+    end,
+    
+    ClearTarget = function()
+        GameState.currentTarget = nil
+        log("🎯 Target cleared")
+    end,
+    
+    Config = CONFIG,
+    
+    -- 🔧 Advanced functions
+    ForceTargetSwitch = function()
+        GameState.currentTarget = nil
+        log("🔄 Force target switch")
+    end,
+    
+    GetCurrentTarget = function()
+        return GameState.currentTarget
+    end,
+    
+    GetEnemiesCount = function()
+        return #getEnemiesInDungeon()
+    end
 }
